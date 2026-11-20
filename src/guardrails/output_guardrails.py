@@ -27,6 +27,22 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+# Thứ tự quan trọng: mẫu có ngữ cảnh (password ...) chạy trước để giá trị đi kèm
+# bị che luôn; mẫu số dùng lookaround để CCCD 12 số không bị cắt nhầm thành SĐT.
+_PII_PATTERNS = {
+    "password": re.compile(
+        r"(?:password|passwd|pwd|mật\s*khẩu|mat\s*khau)\s*(?:is|are|là|la|[:=])\s*\S+",
+        re.IGNORECASE,
+    ),
+    "api_key": re.compile(r"\bsk-[a-zA-Z0-9][a-zA-Z0-9_-]*", re.IGNORECASE),
+    "internal_db": re.compile(r"\bdb\.vinbank\.internal(?::\d+)?", re.IGNORECASE),
+    "internal_secret": re.compile(r"\badmin123\b", re.IGNORECASE),
+    "email": re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}"),
+    "national_id": re.compile(r"(?<!\d)(?:\d{12}|\d{9})(?!\d)"),
+    "phone": re.compile(r"(?<![\d+])(?:\+?84|0)(?:[\s.-]?\d){9,10}(?!\d)"),
+}
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -37,23 +53,14 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
+    response = redacted
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    for name, pattern in _PII_PATTERNS.items():
+        matches = pattern.findall(response)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            redacted = pattern.sub("[REDACTED]", redacted)
 
     return {
         "safe": len(issues) == 0,
@@ -140,6 +147,12 @@ async def llm_safety_check(response_text: str) -> dict:
 #   - Return the (possibly modified) llm_response, or None to keep original
 # ============================================================
 
+OUTPUT_BLOCK_MESSAGE = (
+    "Response withheld by output guardrail: the draft answer was flagged as unsafe. "
+    "How else can I help with your VinBank banking needs?"
+)
+
+
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that checks agent output before sending to user."""
 
@@ -172,16 +185,28 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Che PII / secret bằng regex.
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=result["redacted"])],
+            )
+            response_text = result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        # 2. LLM-as-Judge (tuỳ chọn, mặc định tắt trong lab).
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text=OUTPUT_BLOCK_MESSAGE)],
+                )
+
+        # 3. Trả về phản hồi (đã chỉnh nếu cần).
+        return llm_response
 
 
 # ============================================================

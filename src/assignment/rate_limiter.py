@@ -1,5 +1,5 @@
 """
-Assignment 11 — Rate Limiter starter (TODO).
+Assignment 11 - Rate Limiter.
 
 Sliding-window, per-user rate limiting. Blocks abuse that other
 guardrail layers do not address (flooding / cost attacks).
@@ -11,6 +11,9 @@ import time
 
 from google.adk.plugins import base_plugin
 from google.genai import types
+
+# Dấu hiệu trong thông báo chặn: pipeline dùng để suy ra ``layer = rate_limiter``.
+RATE_LIMIT_MESSAGE_PREFIX = "Rate limit exceeded"
 
 
 class RateLimitPlugin(base_plugin.BasePlugin):
@@ -37,13 +40,18 @@ class RateLimitPlugin(base_plugin.BasePlugin):
         now = time.time()
         window = self.user_windows[user_id]
 
-        # TODO: Implement sliding window:
-        # 1. Pop timestamps older than (now - window_seconds) from the left
-        # 2. If len(window) >= max_requests:
-        #       wait = window_seconds - (now - window[0])
-        #       self.blocked_count += 1
-        #       return self._block_response(
-        #           f"Rate limit exceeded. Try again in {wait:.0f}s."
-        #       )
-        # 3. Else: append now, return None
-        raise NotImplementedError("Implement RateLimitPlugin.on_user_message_callback")
+        # 1. Bỏ các mốc đã ra khỏi cửa sổ trượt.
+        while window and window[0] <= now - self.window_seconds:
+            window.popleft()
+
+        # 2. Đã đủ số request cho phép trong cửa sổ -> chặn, không gọi LLM.
+        if len(window) >= self.max_requests:
+            wait = max(0.0, self.window_seconds - (now - window[0]))
+            self.blocked_count += 1
+            return self._block_response(
+                f"{RATE_LIMIT_MESSAGE_PREFIX}. Try again in {wait:.0f}s."
+            )
+
+        # 3. Còn chỗ -> ghi mốc thời gian và cho qua.
+        window.append(now)
+        return None
